@@ -1,0 +1,188 @@
+heat_template_version: 2016-04-08
+
+description: >
+  A HOT template that creates a group of VMs with Cinder volumes attached.
+  Once created, it does nothing with the instances.
+
+parameters:
+  key_name:
+    type: string
+    description: Name of an existing key pair to use for the instance
+    constraints:
+      - custom_constraint: nova.keypair
+        description: Must name a public key (pair) known to Nova
+    default: jujumanage_key
+  image:
+    type: string
+    description: >
+      Name or ID of the image to use for the instance.
+      You can get the default from
+      http://cloud.fedoraproject.org/fedora-20.x86_64.qcow2
+      There is also
+      http://cloud.fedoraproject.org/fedora-20.i386.qcow2
+      Any image should work since this template
+      does not ask the VM to do anything.
+    constraints:
+      - custom_constraint: glance.image
+        description: Must identify an image known to Glance
+    default: Ubuntu 18.04 LTS
+  vol_size:
+    type: number
+    description: The size of the Cinder volume
+    default: 10
+  vol_type:
+    type: string
+    description: The type of the Cinder volume
+    default: NBS
+  num_instances:
+    type: number
+    description: Number of instances to create
+    default: 3
+  flavor:
+    type: string
+    description: Flavor for the instances to be created
+    default: SM4.2
+    constraints:
+      - custom_constraint: nova.flavor
+        description: Must be a flavor known to Nova
+  public_net:
+    type: string
+    default: Public_Network
+    description: >
+      ID or name of public network for which floating IP addresses will be allocated
+
+resources:
+
+  private_net:
+    type: OS::Neutron::Net
+    properties:
+      name: web_private_net
+
+  cbt_keypair:
+    type: OS::Nova::KeyPair
+    properties:
+      name: cbt_stack_keypair
+      save_private_key: true
+
+  subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_net }
+      cidr: 10.4.2.0/24
+      gateway_ip: 10.4.2.1
+      dns_nameservers:
+        - 8.8.8.8
+        - 8.8.4.4
+      allocation_pools:
+        - start: 10.4.2.10
+          end: 10.4.2.50
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: public_net }
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: subnet }
+
+  securitygroup:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: Allow_SSH
+      rules:
+        - protocol: icmp
+          direction: ingress
+        - direction: ingress
+          protocol: tcp
+          port_range_max: 22
+          port_range_min: 22
+          remote_ip_prefix: 0.0.0.0/0
+  jumpbox:
+    type: OS::Nova::Server
+    depends_on: server_group
+    properties:
+      name: jumpbox
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - network: { get_resource: private_net }
+          subnet: { get_resource: subnet }
+      security_groups:
+        - { get_resource: securitygroup }
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash -x
+            sudo apt update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" git fio gnuplot pdsh collectl iftop iperf3 python-yaml python-lxml blktrace
+            git clone https://github.com/ceph/cbt.git /home/ubuntu/cbt
+            echo "PRIVATE_KEY" >/home/ubuntu/.ssh/cbt_privkey
+            chmod 600 /home/ubuntu/.ssh/cbt_privkey
+            echo "Host 10.4.2.*" >>/home/ubuntu/.ssh/config
+            echo "  StrictHostKeyChecking no" >>/home/ubuntu/.ssh/config
+            echo "  IdentityFile ~/.ssh/cbt_privkey" >>/home/ubuntu/.ssh/config
+            echo "CBT_TEST_YAML" >/home/ubuntu/cbt_raw.yaml
+            sed -i "s/replaceme/HOST_LIST/" /home/ubuntu/cbt_raw.yaml
+            chown ubuntu.ubuntu /home/ubuntu/.ssh/*
+            chown ubuntu.ubuntu /home/ubuntu/*
+            #cd /home/ubuntu/cbt
+            #./cbt.py -a /home/ubuntu ../cbt_raw.yaml
+            #results live in /home/ubuntu/results
+          params:
+            PRIVATE_KEY: { get_attr: [ cbt_keypair, private_key ] }
+            HOST_LIST: { get_attr: [server_group, instance_ip] }
+            CBT_TEST_YAML: |
+              cluster:
+                use_existing: True
+                osds_per_node: 1
+                clients: replaceme
+                recovery_test: True
+                iterations: 2
+              benchmarks:
+                rawfio:
+                    iterations: 2
+                    time: 600
+                    ramp: '0'
+              #      iodepth: [16, 32, 64]
+                    iodepth: [16]
+                    numjobs: 8
+                    mode: [ readwrite, randrw ]
+                    ioengine: libaio
+                    op_size: [4194304, 1048576, 4096] # 4MiB, 1MiB, 4KiB
+                    vol_size: 1024
+                    direct: 1
+                    # Readahead settings
+                    client_ra: 128
+                    use_dir: False
+                    concurrent_procs: 1
+                    fio_cmd: '/usr/bin/fio'
+                    block_devices: [/dev/vdb]
+
+  server_group:
+    type: OS::Heat::ResourceGroup
+    depends_on: cbt_keypair
+    properties:
+      count: { get_param: num_instances }
+      resource_def:
+        type: vm_with_cinder.yaml
+        properties:
+          name: cbt_runner_vm_%index%
+          key_name: cbt_stack_keypair
+          image: { get_param: image }
+          flavor: { get_param: flavor }
+          vol_size: { get_param: vol_size }
+          vol_type: { get_param: vol_type }
+          network: { get_resource: private_net }
+          security_group: { get_resource: securitygroup }
+
+outputs:
+  server_group_addresses:
+    value: { get_attr: [server_group, instance_ip] }
+  privatekey:
+    value: { get_attr: cbt_keypair, private_key }
+
